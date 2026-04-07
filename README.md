@@ -52,6 +52,11 @@ Install into <b>any coding agent</b> in seconds, and supercharge it with <b>AI-c
       <td>🛠️</td>
       <td></td>
     </tr>
+    <tr>
+      <td><a href="https://github.com/block/goose">Codex CLI</a></td>
+      <td>🛠️</td>
+      <td></td>
+    </tr>
   </tbody>
 </table>   
 
