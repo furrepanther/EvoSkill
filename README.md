@@ -11,7 +11,7 @@
   <a href="https://github.com/sentient-agi/EvoSkill/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache 2.0-007ec6?style=for-the-badge" alt="License: Apache 2.0"></a>
 </p>
 
-<b>Supercharge your coding agents with EvoSkill, an agent-agnostic toolkit for automatically creating and improving AI skills, compatible with Claude Code, OpenCode, OpenHands, Goose, and more.</b>
+<b>Supercharge your coding agents with EvoSkill, an agent-agnostic toolkit for automatically creating and improving AI skills, compatible with Gemini CLI, OpenCode, OpenHands, Goose, and more.</b>
 
 <b>EvoSkill</b> uses <b>[GEPA](https://github.com/sentient-agi/gepa-plus)/[DSPy](https://github.com/stanfordnlp/dspy)-style self-improvement algorithms</b> that identify agent failure patterns, propose skill or prompt improvements, evaluate the changes, and keep the best-performing variants, similar to [<b>Karpathy's autoresearch</b>](https://github.com/karpathy/autoresearch).
 
@@ -19,7 +19,7 @@
   <img src="./assets/examples.png" alt="EvoSkill Architecture" style="width: 75%;">
 </p>
 
-Install into <b>any coding agent</b> in seconds, and supercharge it with <b>AI-created skills</b> automatically. Depending on the agent, you are free to use <b>any model provider</b> of your choice ([OpenRouter](https://openrouter.ai/models?q=g), [Anthropic](https://platform.claude.com/docs/en/about-claude/models/overview), [OpenAI](https://platform.openai.com/), [Fireworks](https://fireworks.ai/), and more) and <b>any model</b> you want (Claude, GLM, Minimax, Kimi, GPT, Gemini, Qwen, and others).
+Install into <b>any coding agent</b> in seconds, and supercharge it with <b>AI-created skills</b> automatically. This repo defaults to the Gemini CLI login-backed path, so you can use your existing Google sign-in instead of API keys.
 
 ## 🤖 Supported agents
 
@@ -33,7 +33,7 @@ Install into <b>any coding agent</b> in seconds, and supercharge it with <b>AI-c
   </thead>
   <tbody>
     <tr>
-      <td><a href="https://www.anthropic.com/claude-code">Claude Code</a></td>
+      <td>Gemini CLI</td>
       <td>✅</td>
       <td></td>
     </tr>
@@ -110,7 +110,9 @@ Install into <b>any coding agent</b> in seconds, and supercharge it with <b>AI-c
       <td><b>Continuous evolution</b></td>
       <td>🛠️</td>
       <td>
-        Integrating the ability to improve skills from regular usage.
+        Integrating the ability to improve skills from regular usage. In production,
+        this should run on a twice-daily preset timer cycle so fresh telemetry
+        keeps feeding the next improvement pass.
       </td>
     </tr>
   </tbody>
@@ -144,10 +146,13 @@ uv sync
 pip install -e .
 ```
 
-**API key:**
+**Gemini login:**
 
 ```bash
-export ANTHROPIC_API_KEY=your-key-here
+gemini
+# Sign in with your Google account once; EvoSkill reuses the cached Gemini CLI login.
+# EvoSkill prefers a local `gemini` binary or the built Gemini CLI bundle; it no longer
+# shells out through `npx` on the hot path.
 ```
 
 ---
@@ -162,7 +167,7 @@ Run `evoskill init` inside any git repository:
 $ evoskill init
 
   EvoSkill — Project Setup
-  Which harness? › claude
+  Which harness? › gemini
   Evolution mode? › skill_only — agent learns new skills (recommended)
   Dataset path? › ./data/questions.csv
   Question column name? › question
@@ -241,6 +246,7 @@ Copy `.claude/program.yaml` and `.claude/skills/` into your deployment to use th
 |---------|-------------|
 | `evoskill init` | Initialize a new project (creates `.evoskill/`) |
 | `evoskill run` | Run the self-improvement loop |
+| `evoskill schedule` | Run the loop on a twice-daily cadence |
 | `evoskill eval` | Evaluate the best program on the validation set |
 | `evoskill skills` | List all skills discovered so far |
 | `evoskill diff` | Diff baseline vs best, or between two iterations |
@@ -258,6 +264,22 @@ evoskill run [--continue] [--verbose] [--quiet]
 | `--continue` | Resume from the existing frontier instead of starting fresh. Preserves all `program/*` branches, `frontier/*` tags, feedback history, and the sampling checkpoint so the loop picks up exactly where it left off. |
 | `--verbose` | Show per-sample pass/fail results |
 | `--quiet` | Show the progress table only, suppress proposer output |
+
+### `evoskill schedule`
+
+```bash
+evoskill schedule [--interval-hours 12] [--verbose] [--quiet]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--interval-hours` | Hours between runs. The default is `12`, which gives a twice-daily cycle. |
+| `--verbose` | Show per-sample pass/fail results |
+| `--quiet` | Show the progress table only, suppress proposer output |
+
+The scheduler runs `evoskill run --continue` on each cycle and checks local system pressure before starting a run. If the machine is busy, it skips that cycle and waits for the next 12-hour cycle instead of piling on more work.
+
+Each watchdog cycle also writes start, result, and stop markers to Memory Fabric so you can tell later whether the supervisor or a run failed.
 
 ### `evoskill diff`
 
@@ -289,8 +311,8 @@ Deletes all `program/*` branches, `frontier/*` tags, the loop checkpoint, and fe
 
 ```toml
 [harness]
-name = "claude"        # "claude" or "opencode"
-model = "sonnet"       # model alias or full model ID (e.g. "claude-sonnet-4-6")
+name = "gemini"        # "gemini" or "opencode"
+model = "gemini-3.1-pro-preview"  # model alias or full model ID
 data_dirs = []         # extra directories the agent can read
 
 [evolution]
@@ -327,8 +349,8 @@ type = "multi_tolerance"     # see scorer types below
 [scorer]
 type = "llm"
 rubric = "Award 1.0 if the answer is numerically correct within 5%, 0.0 otherwise."
-model = "claude-sonnet-4-6"   # defaults to claude-sonnet-4-6
-provider = "anthropic"        # "anthropic", "openai", or "google"
+model = "gemini-3.1-pro-preview"  # defaults to the Gemini Pro preview
+provider = "google"               # "google" or "openai"
 ```
 
 **Script scorer options:**
@@ -352,6 +374,7 @@ The self-improvement loop follows five stages:
 3. **Generator** — Creates the proposed changes: writes new skill files or rewrites the system prompt.
 4. **Evaluator** — Scores the new program variant on a held-out validation set to measure improvement.
 5. **Frontier** — Tracks the top-N performing programs as git branches; the best survive to the next iteration.
+6. **Memory Fabric** — Publishes the run family summary plus each kept skill so future runs can retrieve the latest lessons directly.
 
 This cycle repeats for a configurable number of iterations, automatically converging on stronger agent configurations.
 

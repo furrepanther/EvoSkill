@@ -8,12 +8,63 @@ if TYPE_CHECKING:
     from src.schemas import ProposerResponse, SkillProposerResponse, PromptProposerResponse
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    content = str(text or "").strip()
+    if len(content) <= limit:
+        return content
+    if limit <= 12:
+        return content[:limit]
+    return content[: limit - 12].rstrip() + "…[truncated]"
+
+
+def _get_existing_skills() -> list[str]:
+    skills_dir = Path(".claude/skills")
+    existing_skills: list[str] = []
+    if skills_dir.exists():
+        for skill_dir in skills_dir.iterdir():
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                existing_skills.append(skill_dir.name)
+    return existing_skills
+
+
+def _summarize_trace_for_memory(
+    trace: "AgentTrace",
+    *,
+    head_chars: int,
+    tail_chars: int,
+) -> str:
+    result_text = str(trace.result or "")
+    if len(result_text) > head_chars + tail_chars:
+        truncated_middle = len(result_text) - head_chars - tail_chars
+        result_section = (
+            f"### Start:\n{result_text[:head_chars]}\n"
+            f"\n[... {truncated_middle:,} characters truncated ...]\n"
+            f"### End:\n{result_text[-tail_chars:]}"
+        )
+    else:
+        result_section = f"## Full Result\n{result_text}"
+
+    lines = [
+        f"Model: {trace.model}",
+        f"Turns: {trace.num_turns}",
+        f"Duration: {trace.duration_ms}ms",
+        f"Is Error: {trace.is_error}",
+    ]
+    if trace.parse_error:
+        lines.append(f"Parse Error: {trace.parse_error}")
+    if trace.output:
+        lines.append(f"Output: {trace.output}")
+    lines.append(f"\n{result_section}")
+    return "\n".join(lines)
+
+
 def build_proposer_query(
     traces_with_answers: list[tuple["AgentTrace", str, str, str]],
     feedback_history: str,
     evolution_mode: str = "skill_only",
     truncation_level: int = 0,
     task_constraints: str = "",
+    memory_context_section: str = "",
 ) -> str:
     """Build the query for the proposer agent from multiple failure traces.
 
@@ -23,6 +74,7 @@ def build_proposer_query(
         evolution_mode: "skill_only" or "prompt_only" - affects trace truncation.
         truncation_level: Context reduction level (0=full, 1=moderate, 2=aggressive).
         task_constraints: Optional task-specific constraints to include in the query.
+        memory_context_section: Optional pre-rendered Memory Fabric context section.
 
     Returns:
         Formatted query string for the proposer.
@@ -48,12 +100,7 @@ def build_proposer_query(
             feedback_history = "\n".join(feedback_lines_list[-feedback_lines:])
 
     # Get existing skills for context
-    skills_dir = Path(".claude/skills")
-    existing_skills = []
-    if skills_dir.exists():
-        for skill_dir in skills_dir.iterdir():
-            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
-                existing_skills.append(skill_dir.name)
+    existing_skills = _get_existing_skills()
     skills_list = "\n".join([f"- {s}" for s in existing_skills]) or "None"
 
     # Collect categories for summary
@@ -85,8 +132,9 @@ Ground Truth: {ground_truth}
     failures_text = "\n".join(failure_sections)
 
     constraints_section = f"\n## Task Constraints\n{task_constraints}\n" if task_constraints else ""
+    memory_section = f"{memory_context_section}\n\n" if memory_context_section else ""
 
-    return f"""## Existing Skills (check before proposing new ones)
+    return f"""{memory_section}## Existing Skills (check before proposing new ones)
 {skills_list}
 {constraints_section}
 ## Previous Attempts Feedback
@@ -104,6 +152,81 @@ Analyze the patterns across these failures to identify a GENERAL improvement, no
 3. If no → propose a NEW skill (action="create")
 4. Reference any related DISCARDED iterations and explain how your proposal differs
 5. Identify what COMMON pattern or capability gap caused these failures across categories"""
+
+
+def build_memory_retrieval_query(
+    traces_with_answers: list[tuple["AgentTrace", str, str, str]],
+    feedback_history: str,
+    evolution_mode: str = "skill_only",
+    truncation_level: int = 0,
+    task_constraints: str = "",
+) -> str:
+    """Build a compact query for Memory Fabric retrieval."""
+    TRUNCATION_SETTINGS = [
+        (12_000, 4_000, None, None),
+        (8_000, 2_000, 20, 3),
+        (4_000, 1_000, 5, 2),
+    ]
+    head_chars, tail_chars, feedback_lines, max_failures = TRUNCATION_SETTINGS[
+        min(truncation_level, len(TRUNCATION_SETTINGS) - 1)
+    ]
+
+    if max_failures is not None and len(traces_with_answers) > max_failures:
+        traces_with_answers = traces_with_answers[:max_failures]
+
+    if feedback_lines is not None:
+        feedback_lines_list = feedback_history.split("\n")
+        if len(feedback_lines_list) > feedback_lines:
+            feedback_history = "\n".join(feedback_lines_list[-feedback_lines:])
+
+    existing_skills = _get_existing_skills()
+    skills_list = "\n".join([f"- {s}" for s in existing_skills]) or "None"
+
+    categories = [cat for _, _, _, cat in traces_with_answers]
+    category_summary = ", ".join(sorted(set(categories))) or "none"
+
+    failure_sections = []
+    for i, (trace, agent_answer, ground_truth, category) in enumerate(traces_with_answers, 1):
+        if evolution_mode == "prompt_only":
+            effective_head = min(head_chars, 4_000)
+            effective_tail = min(tail_chars, 1_000)
+        else:
+            effective_head = head_chars
+            effective_tail = tail_chars
+
+        trace_summary = _summarize_trace_for_memory(
+            trace,
+            head_chars=effective_head,
+            tail_chars=effective_tail,
+        )
+
+        failure_sections.append(f"""### Failure {i} [Category: {category}]
+{trace_summary}
+
+Agent Answer: {_truncate_text(agent_answer, 2_000)}
+Ground Truth: {_truncate_text(ground_truth, 2_000)}
+""")
+
+    failures_text = "\n".join(failure_sections)
+    constraints_section = f"## Task Constraints\n{task_constraints}\n\n" if task_constraints else ""
+
+    return f"""## Current Skills
+{skills_list}
+
+{constraints_section}## Recent Feedback
+{_truncate_text(feedback_history, 4_000)}
+
+## Retrieval Goal
+Find prior incidents, lessons, telemetry, or skill notes that match the failure patterns below.
+
+## Current Failures ({len(traces_with_answers)} samples across categories: {category_summary})
+
+{failures_text}
+
+## Retrieval Hints
+1. Look for repeated root causes or implementation mistakes.
+2. Look for existing skills that should have handled these failures.
+3. Look for notes about model launch issues, watchdog behavior, telemetry gaps, or prompt/skill regressions."""
 
 
 def build_skill_query(proposer_trace: "AgentTrace[ProposerResponse]") -> str:

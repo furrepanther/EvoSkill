@@ -24,10 +24,15 @@ TASK_MD_TEMPLATE = (
 
 
 def _write_config(path: Path, answers: dict) -> None:
+    harness_model = (
+        'gemini-3.1-pro-preview'
+        if answers['harness'] == 'gemini'
+        else 'deepseek-ai/DeepSeek-V3'
+    )
     config = {
         'harness': {
             'name': answers['harness'],
-            'model': 'sonnet',
+            'model': harness_model,
             'data_dirs': answers['data_dirs'],
         },
         'evolution': {
@@ -73,8 +78,8 @@ def init_cmd():
 
     harness = questionary.select(
         'Which harness?',
-        choices=['claude', 'opencode'],
-        default='claude',
+        choices=['gemini', 'opencode'],
+        default='gemini',
     ).ask()
 
     mode = questionary.select(
@@ -101,7 +106,7 @@ def init_cmd():
 
     data_dirs = [v.strip() for v in data_dirs_raw.split(',') if v.strip()]
 
-    for subdir in ('data', 'skills', 'frontier', 'reports', 'logs', 'prompts'):
+    for subdir in ('data', 'skills', 'frontier', 'reports', 'logs', 'prompts', 'telemetry'):
         d = evoskill_dir / subdir
         d.mkdir(parents=True, exist_ok=True)
 

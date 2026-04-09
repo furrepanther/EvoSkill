@@ -27,8 +27,16 @@ from src.agent_profiles import (
 )
 from src.agent_profiles.base_agent.base_agent import make_base_agent_options_from_task
 from src.agent_profiles.skill_generator import get_project_root
+from src.evoskill_memory import publish_evoskill_run_memory
+from src.gemini_cli import (
+    choose_gemini_model,
+    infer_llm_provider,
+    normalize_gemini_model,
+    run_gemini_cli,
+)
 from src.loop import SelfImprovingLoop, LoopConfig, LoopAgents
 from src.registry import ProgramManager
+from src.telemetry import RunTelemetry, make_run_id
 from src.schemas import (
     AgentResponse,
     SkillProposerResponse,
@@ -87,9 +95,10 @@ def _build_table(rows: list[dict], baseline_score: float | None) -> Table:
 class LoopDisplay:
     """Manages the rich live table + inline proposer output."""
 
-    def __init__(self, verbose: bool = False, quiet: bool = False):
+    def __init__(self, verbose: bool = False, quiet: bool = False, telemetry: RunTelemetry | None = None):
         self.verbose = verbose
         self.quiet = quiet
+        self.telemetry = telemetry
         self.rows: list[dict] = []
         self.baseline_score: float | None = None
         self.skills_kept: list[SkillEntry] = []
@@ -113,6 +122,9 @@ class LoopDisplay:
             self._live.update(_build_table(self.rows, self.baseline_score))
 
     def on_event(self, event: str, data: dict[str, Any]) -> None:
+        if self.telemetry is not None:
+            self.telemetry.add_event(event, **dict(data))
+
         if event == "baseline":
             self.baseline_score = data["score"]
             self.rows.append({
@@ -231,15 +243,13 @@ def _load_and_split(cfg: ProjectConfig):
     )
 
 
-def _infer_provider(model: str) -> str:
-    """Infer the LLM provider from the model name."""
-    if model.startswith("claude"):
-        return "anthropic"
-    if model.startswith(("gpt-", "o1", "o3", "o4")):
-        return "openai"
-    if model.startswith("gemini"):
-        return "google"
-    return "anthropic"  # fallback
+def _build_dataset_summary(train_pools: dict[str, list[tuple[str, str]]], val_data: list[tuple[str, str, str]]) -> dict[str, Any]:
+    return {
+        "train_categories": sorted(train_pools.keys()),
+        "train_counts": {category: len(rows) for category, rows in train_pools.items()},
+        "validation_samples": len(val_data),
+        "training_samples": sum(len(rows) for rows in train_pools.values()),
+    }
 
 
 async def _call_llm(provider: str, model: str, prompt: str) -> str:
@@ -268,18 +278,30 @@ async def _call_llm(provider: str, model: str, prompt: str) -> str:
         return response.choices[0].message.content
 
     if provider == "google":
-        try:
-            from google import genai
-        except ImportError:
-            raise RuntimeError("google-genai package not installed. Run: uv add google-genai")
-        client = genai.Client()
-        response = await client.aio.models.generate_content(model=model, contents=prompt)
-        return response.text
+        result = await run_gemini_cli(
+            prompt,
+            model=normalize_gemini_model(model),
+            approval_mode="yolo",
+            output_format="json",
+            cwd=Path.cwd(),
+        )
+        return result.response
 
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def _make_scorer(cfg: ProjectConfig):
+def _resolve_gemini_harness_model(cfg: ProjectConfig) -> tuple[str | None, str | None]:
+    """Resolve the harness model, using Gemini quota to choose a candidate."""
+    if cfg.harness.name != "gemini":
+        return cfg.harness.model, None
+
+    selection = asyncio.run(
+        choose_gemini_model(cfg.harness.model, cwd=cfg.project_root)
+    )
+    return selection.selected_model, selection.reason
+
+
+def _make_scorer(cfg: ProjectConfig, gemini_model: str | None = None):
     from src.loop.runner import _score_multi_tolerance
 
     if cfg.scorer.type == "exact":
@@ -294,8 +316,8 @@ def _make_scorer(cfg: ProjectConfig):
         import asyncio
 
         rubric = cfg.scorer.rubric or "Award 1.0 if correct, 0.0 if wrong."
-        model = cfg.scorer.model or "claude-sonnet-4-6"
-        provider = cfg.scorer.provider or _infer_provider(model)
+        model = cfg.scorer.model or gemini_model or "gemini-3.1-pro-preview"
+        provider = cfg.scorer.provider or infer_llm_provider(model)
 
         async def _llm_score(question: str, predicted: str, ground_truth: str) -> float:
             prompt = (
@@ -353,11 +375,22 @@ def run_cmd(continue_loop: bool, verbose: bool, quiet: bool):
     if not cfg.task_constraints and not quiet:
         console.print("[yellow]Warning:[/yellow] No constraints defined in task.md — skills may be unconstrained.")
 
-    console.print(f"\n  [bold]EvoSkill[/bold] — {cfg.evolution.mode}  |  {cfg.harness.name}  |  {cfg.evolution.iterations} iterations\n")
+    try:
+        harness_model, harness_reason = _resolve_gemini_harness_model(cfg)
+    except RuntimeError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise SystemExit(1)
+
+    console.print(
+        f"\n  [bold]EvoSkill[/bold] — {cfg.evolution.mode}  |  {cfg.harness.name}  |  "
+        f"{harness_model or 'default'}  |  {cfg.evolution.iterations} iterations\n"
+    )
+    if harness_reason:
+        console.print(f"  Gemini model selection: {harness_model} ({harness_reason})\n")
 
     # Map harness to sdk
-    sdk = cfg.harness.name  # "claude" or "opencode"
-    set_sdk(sdk)
+    sdk = cfg.harness.name
+    set_sdk(sdk, harness_model)
 
     # Load dataset
     try:
@@ -370,7 +403,7 @@ def run_cmd(continue_loop: bool, verbose: bool, quiet: bool):
 
     # Build agents — use task.md description as the base agent prompt
     base_factory = make_base_agent_options_from_task(
-        cfg.task_description, model=cfg.harness.model, data_dirs=cfg.harness.data_dirs
+        cfg.task_description, model=harness_model, data_dirs=cfg.harness.data_dirs
     )
     agents = LoopAgents(
         base=Agent(base_factory, AgentResponse),
@@ -392,13 +425,36 @@ def run_cmd(continue_loop: bool, verbose: bool, quiet: bool):
         continue_mode=continue_loop,
     )
 
-    display = LoopDisplay(verbose=verbose, quiet=quiet)
+    run_id = make_run_id()
+    telemetry = RunTelemetry.create(
+        run_id=run_id,
+        project_root=cfg.project_root,
+        task_name=cfg.project_root.name or "evoskill",
+        task_description=cfg.task_description,
+        task_constraints=cfg.task_constraints,
+        dataset_path=cfg.dataset_path,
+        harness=cfg.harness.name,
+        model=harness_model,
+        evolution_mode=loop_config.evolution_mode,
+        iterations_requested=loop_config.max_iterations,
+        frontier_size=loop_config.frontier_size,
+        concurrency=loop_config.concurrency,
+        failure_samples=loop_config.failure_sample_count,
+        train_ratio=cfg.dataset.train_ratio,
+        val_ratio=cfg.dataset.val_ratio,
+        dataset_summary=_build_dataset_summary(train_pools, val_data),
+    )
+    telemetry.attach_artifact("feedback_history", cfg.project_root / ".claude" / "feedback_history.md")
+    telemetry.attach_artifact("loop_checkpoint", cfg.project_root / ".claude" / "loop_checkpoint.json")
+    telemetry.attach_artifact("skills_dir", cfg.project_root / ".claude" / "skills")
+
+    display = LoopDisplay(verbose=verbose, quiet=quiet, telemetry=telemetry)
     display.start()
 
     try:
         loop = SelfImprovingLoop(
-            loop_config, agents, manager, train_pools, val_data,
-            scorer=_make_scorer(cfg),
+        loop_config, agents, manager, train_pools, val_data,
+            scorer=_make_scorer(cfg, harness_model),
             on_event=display.on_event,
             task_constraints=cfg.task_constraints,
         )
@@ -407,18 +463,50 @@ def run_cmd(continue_loop: bool, verbose: bool, quiet: bool):
         display.stop()
 
     # Build and print report
+    telemetry_path = cfg.project_root / ".evoskill" / "telemetry" / f"run-{run_id}.json"
     report = RunReport(
-        baseline_score=display.baseline_score or 0.0,
+        baseline_score=result.baseline_score,
         final_score=result.best_score,
         iterations_completed=result.iterations_completed,
         best_program=result.best_program,
         rows=display.rows,
         skills_kept=display.skills_kept,
         skills_proposed=display.skills_proposed,
+        run_id=run_id,
         project_root=cfg.project_root,
         total_cost_usd=result.total_cost_usd,
+        telemetry_path=telemetry_path,
     )
     report.print_summary()
 
     report_path = report.save()
-    console.print(f"  Full report: {report_path}\n")
+    telemetry.attach_artifact("report_markdown", report_path)
+    telemetry.attach_artifact("telemetry_bundle", telemetry_path)
+    telemetry.finalize(
+        baseline_score=result.baseline_score,
+        final_score=result.best_score,
+        best_program=result.best_program,
+        iterations_completed=result.iterations_completed,
+        total_cost_usd=result.total_cost_usd,
+    )
+    telemetry.save(telemetry_path)
+
+    memory_results = publish_evoskill_run_memory(
+        run_id=run_id,
+        project_root=cfg.project_root,
+        best_program=result.best_program,
+        baseline_score=result.baseline_score,
+        final_score=result.best_score,
+        iterations_completed=result.iterations_completed,
+        total_cost_usd=result.total_cost_usd,
+        skills_kept=result.skills_kept,
+        report_path=report_path,
+        telemetry_path=telemetry_path,
+    )
+    if memory_results:
+        ok_count = sum(1 for item in memory_results if item.status == "ok")
+        console.print(f"  Memory Fabric: {ok_count}/{len(memory_results)} record(s) written")
+
+    console.print(f"  Full report: {report_path}")
+    console.print(f"  Telemetry: {telemetry_path}\n")
+    return report

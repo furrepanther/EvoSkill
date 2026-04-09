@@ -9,7 +9,11 @@ from rich.console import Console
 from rich.table import Table
 
 from src.cli.config import load_config
-from src.cli.commands.run import _load_and_split, _make_scorer
+from src.cli.commands.run import (
+    _load_and_split,
+    _make_scorer,
+    _resolve_gemini_harness_model,
+)
 from src.agent_profiles import Agent, make_base_agent_options, set_sdk
 from src.agent_profiles.skill_generator import get_project_root
 from src.evaluation import evaluate_agent_parallel
@@ -25,7 +29,14 @@ def eval_cmd(verbose: bool):
     """Evaluate the best skills on the validation set."""
     cfg = load_config()
     sdk = cfg.harness.name
-    set_sdk(sdk)
+    try:
+        harness_model, harness_reason = _resolve_gemini_harness_model(cfg)
+    except RuntimeError as exc:
+        console.print(f'[red]Error:[/red] {exc}')
+        raise SystemExit(1)
+    if harness_reason:
+        console.print(f'  Gemini model selection: {harness_model} ({harness_reason})\n')
+    set_sdk(sdk, harness_model)
 
     try:
         _, val_data = _load_and_split(cfg)
@@ -44,7 +55,7 @@ def eval_cmd(verbose: bool):
     console.print(f'\n  Evaluating [bold]{best}[/bold] on {len(val_data)} samples...\n')
 
     agent = Agent(make_base_agent_options(data_dirs=cfg.harness.data_dirs), AgentResponse)
-    scorer = _make_scorer(cfg)
+    scorer = _make_scorer(cfg, harness_model)
 
     qa_data = [(q, a) for q, a, _ in val_data]
     results = asyncio.run(

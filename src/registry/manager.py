@@ -81,7 +81,7 @@ class ProgramManager:
         self._write_config(config)
 
         # Stage and commit
-        self._git_add(self.PROGRAM_FILE)
+        self._git_add(self.PROGRAM_FILE, force=True)
         # Also stage any skills that might exist
         skills_dir = self.cwd / ".claude" / "skills"
         if skills_dir.exists():
@@ -359,7 +359,7 @@ class ProgramManager:
         config = self._read_config()
         updated_config = config.with_score(score)
         self._write_config(updated_config)
-        self._git_add(self.PROGRAM_FILE)
+        self._git_add(self.PROGRAM_FILE, force=True)
         self._git_commit(f"Update score: {score:.4f}")
 
         # Switch back
@@ -403,6 +403,8 @@ class ProgramManager:
 
         # Stage all changes
         self._git_add(".")
+        if (self.cwd / self.PROGRAM_FILE).exists():
+            self._git_add(self.PROGRAM_FILE, force=True)
 
         # Get program name for default message
         try:
@@ -489,9 +491,13 @@ class ProgramManager:
         """Delete a branch."""
         self._run_git(["branch", "-D", branch])
 
-    def _git_add(self, path: str) -> None:
+    def _git_add(self, path: str, force: bool = False) -> None:
         """Stage a file or directory."""
-        self._run_git(["add", path])
+        args = ["add"]
+        if force:
+            args.append("-f")
+        args.append(path)
+        self._run_git(args)
 
     def _git_commit(self, message: str) -> None:
         """Create a commit if there are staged changes."""

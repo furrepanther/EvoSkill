@@ -38,6 +38,18 @@ Propose a prompt modification when ALL of these apply:
 
 ## Output Requirements
 
+Output in JSON format only. Do not wrap the response in markdown, code fences, or commentary.
+Use exactly this structure:
+
+{
+  "proposed_prompt_change": "detailed prompt modification",
+  "justification": "clear reasoning for the change"
+}
+
+Rules:
+- Keep the field names exact.
+- Keep the value for proposed_prompt_change concrete and reusable.
+
 Based on your analysis, provide:
 
 1. **proposed_prompt_change**: A detailed description of the prompt modification needed

@@ -1,11 +1,21 @@
 import asyncio
-import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, Type, TypeVar, Union
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
-from .sdk_config import is_claude_sdk
+from .sdk_config import get_model, is_claude_sdk, is_gemini_sdk
+from .structured_output import coerce_structured_output
+from src.gemini_cli import (
+    build_gemini_prompt,
+    extract_gemini_cwd,
+    extract_gemini_include_directories,
+    extract_gemini_model,
+    extract_gemini_system_prompt,
+    extract_gemini_tools,
+    run_gemini_cli,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +34,33 @@ OptionsProvider = Union[
     dict[str, Any],
     Callable[[], Union[ClaudeAgentOptionsType, dict[str, Any]]],
 ]
+
+
+def _resolve_gemini_model(options: Union[ClaudeAgentOptionsType, dict[str, Any]]) -> str:
+    """Pick the best available Gemini model for the current run."""
+    model = extract_gemini_model(options)
+    if model:
+        return model
+
+    current_model = get_model()
+    if current_model:
+        return current_model
+
+    return "gemini-3.1-pro-preview"
+
+
+def _extract_tools(options: Union[ClaudeAgentOptionsType, dict[str, Any]]) -> list[str]:
+    """Extract the declared tool list for telemetry."""
+    if isinstance(options, dict):
+        tools = options.get("tools", {})
+        if isinstance(tools, dict):
+            return [str(name) for name in tools.keys()]
+        if isinstance(tools, list):
+            return [str(name) for name in tools]
+        return []
+
+    allowed_tools = getattr(options, "allowed_tools", None) or []
+    return [str(name) for name in allowed_tools]
 
 
 class AgentTrace(BaseModel, Generic[T]):
@@ -45,6 +82,9 @@ class AgentTrace(BaseModel, Generic[T]):
 
     # The validated structured output (None if parsing failed)
     output: Optional[T] = None
+
+    # True when the output had to be recovered from plain assistant text
+    structured_output_repaired: bool = False
 
     # Error info when output parsing fails
     parse_error: Optional[str] = None
@@ -150,6 +190,25 @@ class Agent(Generic[T]):
             async with ClaudeSDKClient(options) as client:
                 await client.query(query)
                 return [msg async for msg in client.receive_response()]
+        if is_gemini_sdk():
+            # Gemini CLI path
+            system_prompt = extract_gemini_system_prompt(options)
+            prompt = build_gemini_prompt(system_prompt, query)
+            cwd = extract_gemini_cwd(options)
+            include_directories = extract_gemini_include_directories(options)
+            model_name = _resolve_gemini_model(options)
+
+            gemini_result = await run_gemini_cli(
+                prompt,
+                model=model_name,
+                cwd=cwd,
+                # Unattended EvoSkill runs should not pause for Gemini approvals.
+                approval_mode="yolo",
+                output_format="json",
+                include_directories=include_directories or None,
+            )
+
+            return [gemini_result]
         else:
             # OpenCode SDK path
             from opencode_ai import AsyncOpencode
@@ -235,19 +294,12 @@ class Agent(Generic[T]):
             last = messages[-1]
 
             # Try to parse structured output
-            output = None
-            parse_error = None
             raw_structured_output = last.structured_output
-
-            if raw_structured_output is not None:
-                try:
-                    output = self.response_model.model_validate(raw_structured_output)
-                except (ValidationError, json.JSONDecodeError, TypeError) as e:
-                    parse_error = f"{type(e).__name__}: {str(e)}"
-            else:
-                parse_error = (
-                    "No structured output returned (context limit likely exceeded)"
-                )
+            output, parse_error, structured_output_repaired = coerce_structured_output(
+                self.response_model,
+                raw_structured_output,
+                result_text=last.result,
+            )
 
             return AgentTrace(
                 uuid=first.data.get("uuid"),
@@ -261,31 +313,63 @@ class Agent(Generic[T]):
                 result=last.result,
                 is_error=last.is_error or parse_error is not None,
                 output=output,
+                structured_output_repaired=structured_output_repaired,
                 parse_error=parse_error,
                 raw_structured_output=raw_structured_output,
                 messages=messages,
+            )
+        if is_gemini_sdk():
+            # Gemini CLI JSON output: one structured wrapper result per query.
+            gemini_result = messages[0]
+            if not hasattr(gemini_result, "response"):
+                raise TypeError(
+                    f"Gemini SDK returned unexpected payload type: {type(gemini_result)}"
+                )
+
+            raw_structured_output = gemini_result.response
+            output, parse_error, structured_output_repaired = coerce_structured_output(
+                self.response_model,
+                raw_structured_output,
+                result_text=gemini_result.response,
+            )
+
+            options = self._get_options()
+            model_name = _resolve_gemini_model(options)
+            tools = _extract_tools(options)
+            session_uuid = str(uuid.uuid4())
+            raw_message = {
+                "provider": "gemini-cli",
+                "response": gemini_result.response,
+                "stats": gemini_result.stats,
+                "command": list(gemini_result.command),
+            }
+
+            return AgentTrace(
+                uuid=session_uuid,
+                session_id=session_uuid,
+                model=model_name,
+                tools=tools,
+                duration_ms=gemini_result.duration_ms,
+                total_cost_usd=0.0,
+                num_turns=1,
+                usage=gemini_result.stats,
+                result=gemini_result.response,
+                is_error=parse_error is not None,
+                output=output,
+                structured_output_repaired=structured_output_repaired,
+                parse_error=parse_error,
+                raw_structured_output=raw_structured_output,
+                messages=[raw_message],
             )
         else:
             # OpenCode SDK: single AssistantMessage with extra fields
             message = messages[0]
 
             # Extract structured output from info dict (extra field)
-            output = None
-            parse_error = None
             raw_structured_output = None
 
             if hasattr(message, "info") and message.info:
                 raw_structured_output = message.info.get("structured")
-
-            if raw_structured_output is not None:
-                try:
-                    output = self.response_model.model_validate(raw_structured_output)
-                except (ValidationError, json.JSONDecodeError, TypeError) as e:
-                    parse_error = f"{type(e).__name__}: {str(e)}"
-            else:
-                parse_error = (
-                    "No structured output returned (context limit likely exceeded)"
-                )
 
             # Extract text from parts (extra field)
             result_text = ""
@@ -293,6 +377,12 @@ class Agent(Generic[T]):
                 for part in message.parts:
                     if isinstance(part, dict) and part.get("type") == "text":
                         result_text += part.get("text", "")
+
+            output, parse_error, structured_output_repaired = coerce_structured_output(
+                self.response_model,
+                raw_structured_output,
+                result_text=result_text,
+            )
 
             # Get metadata from info dict
             info = message.info if hasattr(message, "info") else {}
@@ -323,6 +413,7 @@ class Agent(Generic[T]):
                 result=result_text,
                 is_error=parse_error is not None,
                 output=output,
+                structured_output_repaired=structured_output_repaired,
                 parse_error=parse_error,
                 raw_structured_output=raw_structured_output,
                 messages=messages,

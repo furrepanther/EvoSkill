@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Callable, Any
 
 from src.agent_profiles import Agent
@@ -18,7 +19,9 @@ from src.agent_profiles import (
     prompt_generator_options,
 )
 from src.loop import SelfImprovingLoop, LoopConfig, LoopAgents, LoopResult
+from src.evoskill_memory import publish_evoskill_run_memory
 from src.registry import ProgramManager
+from src.telemetry import make_run_id
 from src.schemas import (
     AgentResponse,
     SkillProposerResponse,
@@ -181,8 +184,24 @@ class EvoSkill:
         )
         result = await loop.run()
 
+        run_id = make_run_id()
+        project_root = Path(get_project_root())
+        memory_results = publish_evoskill_run_memory(
+            run_id=run_id,
+            project_root=project_root,
+            best_program=result.best_program,
+            baseline_score=result.baseline_score,
+            final_score=result.best_score,
+            iterations_completed=result.iterations_completed,
+            total_cost_usd=result.total_cost_usd,
+            skills_kept=result.skills_kept,
+        )
+
         print(f"Best: {result.best_program} ({result.best_score:.2%})")
         print(f"Frontier: {result.frontier}")
+        if memory_results:
+            ok_count = sum(1 for item in memory_results if item.status == "ok")
+            print(f"Memory Fabric: {ok_count}/{len(memory_results)} record(s) written")
         return result
 
     def run_sync(self, max_iterations: int | None = None) -> LoopResult:
