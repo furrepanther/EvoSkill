@@ -33,6 +33,20 @@ Before proposing a solution, work through these steps:
 
 ## Output Requirements
 
+Output in JSON format only. Do not wrap the response in markdown, code fences, or commentary.
+Use exactly this structure:
+
+{
+  "optimize_prompt_or_skill": "prompt" | "skill",
+  "proposed_skill_or_prompt": "detailed proposal description",
+  "justification": "clear reasoning for the decision"
+}
+
+Rules:
+- Keep the field names exact.
+- Use "skill" when the fix needs tools, data access, or a workflow.
+- Use "prompt" when the fix is about guidance, mindset, or judgment.
+
 Based on your analysis, provide:
 
 1. **optimize_prompt_or_skill**: Choose "prompt" or "skill"

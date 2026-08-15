@@ -20,7 +20,7 @@ from src.agent_profiles.base import AgentTrace
 def make_run_id(now: datetime | None = None) -> str:
     """Return a stable, filename-safe run identifier."""
     moment = now or datetime.now(timezone.utc)
-    return moment.strftime("%Y-%m-%d-%H%M%S")
+    return moment.strftime("%Y-%m-%d-%H%M%S-%f")
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -45,6 +45,7 @@ class TelemetryTraceSnapshot(BaseModel):
     usage: dict[str, Any]
     result_excerpt: str
     is_error: bool
+    structured_output_repaired: bool = False
     parse_error: str | None = None
     output: Any = None
 
@@ -53,7 +54,10 @@ def trace_to_snapshot(trace: AgentTrace[Any], *, result_chars: int = 1_200) -> T
     """Convert a full AgentTrace into a compact telemetry snapshot."""
     output_payload = None
     if trace.output is not None:
-        output_payload = trace.output.model_dump()
+        if hasattr(trace.output, "model_dump"):
+            output_payload = trace.output.model_dump()
+        else:
+            output_payload = trace.output
 
     return TelemetryTraceSnapshot(
         uuid=trace.uuid,
@@ -66,6 +70,7 @@ def trace_to_snapshot(trace: AgentTrace[Any], *, result_chars: int = 1_200) -> T
         usage=dict(trace.usage),
         result_excerpt=_truncate(trace.result, result_chars),
         is_error=trace.is_error,
+        structured_output_repaired=trace.structured_output_repaired,
         parse_error=trace.parse_error,
         output=output_payload,
     )
@@ -77,10 +82,14 @@ class TelemetryEvent(BaseModel):
     kind: str
     at_utc: str
     iteration: int | None = None
+    total: int | None = None
+    iterations: int | None = None
     parent: str | None = None
     child_name: str | None = None
     category: str | None = None
     question: str | None = None
+    agent_answer: str | None = None
+    ground_truth: str | None = None
     score: float | None = None
     passed: bool | None = None
     n_skills: int | None = None
@@ -91,7 +100,6 @@ class TelemetryEvent(BaseModel):
     justification: str | None = None
     parent_score: float | None = None
     added: bool | None = None
-    total: int | None = None
     best: str | None = None
     best_score: float | None = None
     frontier: list[dict[str, Any]] = Field(default_factory=list)
@@ -175,6 +183,7 @@ class RunTelemetry(BaseModel):
         telemetry.source_map = {
             "sample_traces": "SelfImprovingLoop._evaluate -> AgentTrace",
             "validation_traces": "SelfImprovingLoop._evaluate -> AgentTrace",
+            "memory_context": "src.memory_fabric.retrieve_memory_fabric_context",
             "failure_briefs": "src.loop.helpers.build_proposer_query",
             "feedback_history": ".claude/feedback_history.md",
             "frontier_state": "src.registry.ProgramManager git branches/tags",
@@ -186,22 +195,64 @@ class RunTelemetry(BaseModel):
     def _touch(self) -> None:
         self.updated_at_utc = datetime.now(timezone.utc).isoformat()
 
+    @classmethod
+    def load(cls, path: Path) -> "RunTelemetry":
+        """Load a telemetry bundle from disk."""
+        return cls.model_validate_json(path.read_text(encoding="utf-8"))
+
     def add_event(self, kind: str, **payload: Any) -> TelemetryEvent:
+        payload = dict(payload)
+        if kind == "proposal" and "summary" in payload and "proposal" not in payload:
+            payload["proposal"] = payload.pop("summary")
+        if kind == "skill_written":
+            if "name" in payload and "child_name" not in payload:
+                payload["child_name"] = payload.pop("name")
+            if "target" in payload and "target_skill" not in payload:
+                payload["target_skill"] = payload.pop("target")
+
         trace_payload = payload.pop("trace", None)
         frontier_payload = payload.pop("frontier", None)
 
         if trace_payload is not None and isinstance(trace_payload, AgentTrace):
             trace_payload = trace_to_snapshot(trace_payload)
+        elif trace_payload is not None and isinstance(trace_payload, dict):
+            trace_payload = TelemetryTraceSnapshot.model_validate(trace_payload)
+
+        normalized_frontier: list[dict[str, Any]] = []
+        if frontier_payload:
+            for item in frontier_payload:
+                if isinstance(item, dict):
+                    normalized_frontier.append(
+                        {
+                            "name": str(item.get("name", "")),
+                            "score": item.get("score"),
+                        }
+                    )
+                else:
+                    name, score = item
+                    normalized_frontier.append({"name": name, "score": score})
+
+        known_fields = set(TelemetryEvent.model_fields)
+        event_payload: dict[str, Any] = {}
+        extra_payload: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in known_fields and key != "extra":
+                event_payload[key] = value
+            else:
+                extra_payload[key] = value
+        if extra_payload:
+            existing_extra = event_payload.get("extra")
+            if isinstance(existing_extra, dict):
+                existing_extra.update(extra_payload)
+            else:
+                event_payload["extra"] = extra_payload
 
         event = TelemetryEvent(
             kind=kind,
             at_utc=datetime.now(timezone.utc).isoformat(),
             trace=trace_payload,
-            frontier=[
-                {"name": name, "score": score}
-                for name, score in frontier_payload
-            ] if frontier_payload else [],
-            **payload,
+            frontier=normalized_frontier,
+            **event_payload,
         )
         self.events.append(event)
         self._touch()
@@ -231,4 +282,3 @@ class RunTelemetry(BaseModel):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
         return path
-

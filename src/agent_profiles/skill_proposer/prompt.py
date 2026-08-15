@@ -79,6 +79,23 @@ Propose a skill when ANY of these apply:
 
 ## Output Requirements
 
+Output in JSON format only. Do not wrap the response in markdown, code fences, or commentary.
+Use exactly this structure:
+
+{
+  "action": "create" | "edit",
+  "target_skill": "existing-skill-name" | null,
+  "proposed_skill": "detailed skill description",
+  "justification": "clear reasoning for the proposal",
+  "related_iterations": ["iter-4", "iter-9"]
+}
+
+Rules:
+- Use "create" when proposing a new skill.
+- Use "edit" when updating an existing skill and fill in target_skill.
+- Use an empty array for related_iterations when none apply.
+- Keep the field names exact.
+
 Based on your analysis, provide:
 
 1. **action**: Either "create" for a new skill or "edit" for modifying an existing skill

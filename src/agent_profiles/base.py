@@ -1,29 +1,80 @@
 import asyncio
-import json
 import logging
+import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, Type, TypeVar, Union
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
-from .sdk_config import is_claude_sdk
+from .sdk_config import get_model, is_gemini_sdk
+from .structured_output import coerce_structured_output
+from src.registry.sdk_utils import options_to_runtime_config
+from src.gemini_cli import (
+    build_gemini_prompt,
+    extract_gemini_cwd,
+    extract_gemini_include_directories,
+    extract_gemini_model,
+    extract_gemini_system_prompt,
+    extract_gemini_tools,
+    run_gemini_cli,
+)
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+OPENCODE_BINARY = Path("/mnt/f/Github/opencode/packages/opencode/dist/opencode-linux-x64/bin/opencode")
 
-# Import ClaudeAgentOptions at module level for type hints only
+# Import SDK options type at module level for type hints only
 if TYPE_CHECKING:
-    from claude_agent_sdk import ClaudeAgentOptions as ClaudeAgentOptionsType
+    from claude_agent_sdk import ClaudeAgentOptions as SDKAgentOptionsType
 else:
-    ClaudeAgentOptionsType = Any
+    SDKAgentOptionsType = Any
 
 # Type alias for options that can be static or dynamically generated
-# Supports both ClaudeAgentOptions and dict (for opencode)
+# Supports both SDK options objects and dict payloads
 OptionsProvider = Union[
-    ClaudeAgentOptionsType,
+    SDKAgentOptionsType,
     dict[str, Any],
-    Callable[[], Union[ClaudeAgentOptionsType, dict[str, Any]]],
+    Callable[[], Union[SDKAgentOptionsType, dict[str, Any]]],
 ]
+
+
+def _resolve_gemini_model(options: Union[SDKAgentOptionsType, dict[str, Any]]) -> str:
+    """Pick the best available Gemini model for the current run."""
+    model = extract_gemini_model(options)
+    if model:
+        return model
+
+    current_model = get_model()
+    if current_model:
+        return current_model
+
+    return "gemini-3.1-pro-preview"
+
+
+def _resolve_opencode_binary() -> Path:
+    """Return the built OpenCode binary for this host."""
+    candidate = OPENCODE_BINARY.expanduser().resolve()
+    if candidate.is_file():
+        return candidate
+    raise RuntimeError(
+        "OpenCode binary missing at "
+        f"{candidate}. Build /mnt/f/Github/opencode before starting EvoSkill."
+    )
+
+
+def _extract_tools(options: Union[SDKAgentOptionsType, dict[str, Any]]) -> list[str]:
+    """Extract the declared tool list for telemetry."""
+    if isinstance(options, dict):
+        tools = options.get("tools", {})
+        if isinstance(tools, dict):
+            return [str(name) for name in tools.keys()]
+        if isinstance(tools, list):
+            return [str(name) for name in tools]
+        return []
+
+    allowed_tools = getattr(options, "allowed_tools", None) or []
+    return [str(name) for name in allowed_tools]
 
 
 class AgentTrace(BaseModel, Generic[T]):
@@ -45,6 +96,9 @@ class AgentTrace(BaseModel, Generic[T]):
 
     # The validated structured output (None if parsing failed)
     output: Optional[T] = None
+
+    # True when the output had to be recovered from plain assistant text
+    structured_output_repaired: bool = False
 
     # Error info when output parsing fails
     parse_error: Optional[str] = None
@@ -102,11 +156,11 @@ class AgentTrace(BaseModel, Generic[T]):
 
 
 class Agent(Generic[T]):
-    """Simple wrapper for running Claude agents.
+    """Simple wrapper for running agent SDK requests.
 
     Args:
-        options: Either a ClaudeAgentOptions instance (static) or a callable
-                 that returns ClaudeAgentOptions (dynamic, called on each run).
+        options: Either an SDK options instance (static) or a callable
+                 that returns SDK options (dynamic, called on each run).
         response_model: Pydantic model for structured output validation.
     """
 
@@ -118,7 +172,7 @@ class Agent(Generic[T]):
         self._options = options
         self.response_model = response_model
 
-    def _get_options(self) -> Union[ClaudeAgentOptionsType, dict[str, Any]]:
+    def _get_options(self) -> Union[SDKAgentOptionsType, dict[str, Any]]:
         """Get options, calling the provider if it's a callable."""
         if callable(self._options):
             return self._options()
@@ -128,36 +182,34 @@ class Agent(Generic[T]):
         """Execute a single query attempt."""
         options = self._get_options()
 
-        if is_claude_sdk():
-            # Claude SDK path
-            from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+        if is_gemini_sdk():
+            # Gemini CLI path
+            system_prompt = extract_gemini_system_prompt(options)
+            prompt = build_gemini_prompt(system_prompt, query)
+            cwd = extract_gemini_cwd(options)
+            include_directories = extract_gemini_include_directories(options)
+            model_name = _resolve_gemini_model(options)
 
-            # Convert dict to ClaudeAgentOptions if needed
-            if isinstance(options, dict):
-                claude_opts = ClaudeAgentOptions(
-                    system_prompt=options.get("system"),
-                    allowed_tools=list(options.get("tools", {}).keys())
-                    if options.get("tools")
-                    else [],
-                    output_format=options.get("format"),
-                    setting_sources=["user", "project"],
-                    permission_mode="acceptEdits",
-                )
-                if "model_id" in options and "claude" in options["model_id"].lower():
-                    claude_opts.model = options["model_id"]
-                options = claude_opts
+            gemini_result = await run_gemini_cli(
+                prompt,
+                model=model_name,
+                cwd=cwd,
+                # Unattended EvoSkill runs should not pause for Gemini approvals.
+                approval_mode="yolo",
+                output_format="json",
+                include_directories=include_directories or None,
+            )
 
-            async with ClaudeSDKClient(options) as client:
-                await client.query(query)
-                return [msg async for msg in client.receive_response()]
+            return [gemini_result]
         else:
-            # OpenCode SDK path
+            # Runtime SDK path
             from opencode_ai import AsyncOpencode
 
-            if not isinstance(options, dict):
-                raise TypeError(
-                    f"OpenCode SDK requires dict options, got {type(options)}"
-                )
+            options = options_to_runtime_config(
+                options,
+                fallback_model=get_model(),
+            )
+            opencode_binary = _resolve_opencode_binary()
 
             # Start opencode server if needed
             import subprocess
@@ -170,7 +222,7 @@ class Agent(Generic[T]):
             except Exception:
                 # Start server
                 subprocess.Popen(
-                    ["opencode", "serve", "--port", "4096", "--hostname", "127.0.0.1"],
+                    [str(opencode_binary), "serve", "--port", "4096", "--hostname", "127.0.0.1"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -195,7 +247,7 @@ class Agent(Generic[T]):
                 extra_body=extra_body if extra_body else None,
             )
 
-            # Return as single-item list for consistency with Claude SDK
+            # Return as single-item list for consistency with the SDK wrapper
             return [message]
 
     async def _run_with_retry(self, query: str) -> list[Any]:
@@ -229,63 +281,58 @@ class Agent(Generic[T]):
     async def run(self, query: str) -> AgentTrace[T]:
         messages = await self._run_with_retry(query)
 
-        if is_claude_sdk():
-            # Claude SDK: messages list with SystemMessage, AssistantMessage, ResultMessage
-            first = messages[0]
-            last = messages[-1]
-
-            # Try to parse structured output
-            output = None
-            parse_error = None
-            raw_structured_output = last.structured_output
-
-            if raw_structured_output is not None:
-                try:
-                    output = self.response_model.model_validate(raw_structured_output)
-                except (ValidationError, json.JSONDecodeError, TypeError) as e:
-                    parse_error = f"{type(e).__name__}: {str(e)}"
-            else:
-                parse_error = (
-                    "No structured output returned (context limit likely exceeded)"
+        if is_gemini_sdk():
+            # Gemini CLI JSON output: one structured wrapper result per query.
+            gemini_result = messages[0]
+            if not hasattr(gemini_result, "response"):
+                raise TypeError(
+                    f"Gemini SDK returned unexpected payload type: {type(gemini_result)}"
                 )
 
+            raw_structured_output = gemini_result.response
+            output, parse_error, structured_output_repaired = coerce_structured_output(
+                self.response_model,
+                raw_structured_output,
+                result_text=gemini_result.response,
+            )
+
+            options = self._get_options()
+            model_name = _resolve_gemini_model(options)
+            tools = _extract_tools(options)
+            session_uuid = str(uuid.uuid4())
+            raw_message = {
+                "provider": "gemini-cli",
+                "response": gemini_result.response,
+                "stats": gemini_result.stats,
+                "command": list(gemini_result.command),
+            }
+
             return AgentTrace(
-                uuid=first.data.get("uuid"),
-                session_id=last.session_id,
-                model=first.data.get("model"),
-                tools=first.data.get("tools", []),
-                duration_ms=last.duration_ms,
-                total_cost_usd=last.total_cost_usd,
-                num_turns=last.num_turns,
-                usage=last.usage,
-                result=last.result,
-                is_error=last.is_error or parse_error is not None,
+                uuid=session_uuid,
+                session_id=session_uuid,
+                model=model_name,
+                tools=tools,
+                duration_ms=gemini_result.duration_ms,
+                total_cost_usd=0.0,
+                num_turns=1,
+                usage=gemini_result.stats,
+                result=gemini_result.response,
+                is_error=parse_error is not None,
                 output=output,
+                structured_output_repaired=structured_output_repaired,
                 parse_error=parse_error,
                 raw_structured_output=raw_structured_output,
-                messages=messages,
+                messages=[raw_message],
             )
         else:
-            # OpenCode SDK: single AssistantMessage with extra fields
+            # Runtime SDK: single assistant message with extra fields
             message = messages[0]
 
             # Extract structured output from info dict (extra field)
-            output = None
-            parse_error = None
             raw_structured_output = None
 
             if hasattr(message, "info") and message.info:
                 raw_structured_output = message.info.get("structured")
-
-            if raw_structured_output is not None:
-                try:
-                    output = self.response_model.model_validate(raw_structured_output)
-                except (ValidationError, json.JSONDecodeError, TypeError) as e:
-                    parse_error = f"{type(e).__name__}: {str(e)}"
-            else:
-                parse_error = (
-                    "No structured output returned (context limit likely exceeded)"
-                )
 
             # Extract text from parts (extra field)
             result_text = ""
@@ -294,22 +341,23 @@ class Agent(Generic[T]):
                     if isinstance(part, dict) and part.get("type") == "text":
                         result_text += part.get("text", "")
 
+            output, parse_error, structured_output_repaired = coerce_structured_output(
+                self.response_model,
+                raw_structured_output,
+                result_text=result_text,
+            )
+
             # Get metadata from info dict
             info = message.info if hasattr(message, "info") else {}
             usage = info.get("tokens", {}) if info else {}
             cost = info.get("cost", 0.0) if info else 0.0
 
-            options = self._get_options()
-            model_name = (
-                options.get("model_id", "unknown")
-                if isinstance(options, dict)
-                else "unknown"
+            options = options_to_runtime_config(
+                self._get_options(),
+                fallback_model=get_model(),
             )
-            tools = (
-                list(options.get("tools", {}).keys())
-                if isinstance(options, dict) and options.get("tools")
-                else []
-            )
+            model_name = str(options.get("model_id", "unknown"))
+            tools = list(options.get("tools", {}).keys()) if options.get("tools") else []
 
             return AgentTrace(
                 uuid=message.session_id or "unknown",
@@ -323,6 +371,7 @@ class Agent(Generic[T]):
                 result=result_text,
                 is_error=parse_error is not None,
                 output=output,
+                structured_output_repaired=structured_output_repaired,
                 parse_error=parse_error,
                 raw_structured_output=raw_structured_output,
                 messages=messages,

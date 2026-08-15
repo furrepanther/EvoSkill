@@ -12,7 +12,7 @@ from datetime import datetime
 
 class ProgramConfig(BaseModel):
     """
-    Program configuration stored in .claude/program.yaml
+    Program configuration stored in the project registry file.
 
     Each program represents a distinct agent configuration that includes
     system prompts, allowed tools, and output format specifications.
@@ -28,7 +28,7 @@ class ProgramConfig(BaseModel):
 
     # Agent configuration
     system_prompt: dict[str, Any] = Field(
-        description="System prompt configuration for ClaudeAgentOptions"
+        description="System prompt configuration for the agent runtime"
     )
     allowed_tools: list[str] = Field(
         default_factory=list, description="List of allowed tool names"

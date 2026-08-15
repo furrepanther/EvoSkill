@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from src.telemetry import make_run_id
 
 
 @dataclass
@@ -24,8 +25,10 @@ class RunReport:
     rows: list[dict]
     skills_kept: list[SkillEntry]
     skills_proposed: int
+    run_id: str = field(default_factory=make_run_id)
     project_root: Path = field(default_factory=Path.cwd)
     total_cost_usd: float = 0.0
+    telemetry_path: Path | None = None
 
     @property
     def improvement(self) -> float:
@@ -57,16 +60,14 @@ class RunReport:
     def save(self) -> Path:
         reports_dir = self.evoskill_dir / 'reports'
         reports_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
-        path = reports_dir / f'run-{timestamp}.md'
+        path = reports_dir / f'run-{self.run_id}.md'
         path.write_text(self._render_markdown())
         return path
 
     def _render_markdown(self) -> str:
         sign = '+' if self.improvement >= 0 else ''
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M')
         lines = [
-            f'# EvoSkill Run Report — {ts}',
+            f'# EvoSkill Run Report — {self.run_id}',
             '',
             '## Summary',
             '',
@@ -80,11 +81,20 @@ class RunReport:
             f'| Best program | `{self.best_program}` |',
             f'| Total cost | ${self.total_cost_usd:.4f} |',
             '',
+            '## Artifacts',
+            '',
+            f'- Run report: `{self.evoskill_dir / "reports" / f"run-{self.run_id}.md"}`',
+        ]
+        if self.telemetry_path is not None:
+            lines.append(f'- Telemetry bundle: `{self.telemetry_path}`')
+
+        lines.extend([
+            '',
             '## Iteration Log',
             '',
             '| Iter | Accuracy | Δ | Skills | Status |',
             '|------|----------|---|--------|--------|',
-        ]
+        ])
         for row in self.rows:
             delta_str = '—'
             if row.get('delta') is not None:

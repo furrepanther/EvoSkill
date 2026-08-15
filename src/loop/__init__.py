@@ -1,29 +1,30 @@
-"""Self-improving agent loop module.
+"""Lazy exports for the self-improving agent loop."""
 
-This module provides a modular, composable interface for running
-self-improving agent loops with git-based versioning.
+from __future__ import annotations
 
-Example usage:
-    from src.loop import SelfImprovingLoop, LoopConfig, LoopAgents
-    from src.agent_profiles import Agent, base_agent_options, proposer_options
-    from src.registry import ProgramManager
+from importlib import import_module
+from typing import Any
 
-    agents = LoopAgents(
-        base=Agent(base_agent_options, AgentResponse),
-        proposer=Agent(proposer_options, ProposerResponse),
-        skill_generator=Agent(skill_generator_options, ToolGeneratorResponse),
-        prompt_generator=Agent(prompt_generator_options, PromptGeneratorResponse),
-    )
-    manager = ProgramManager(cwd=get_project_root())
-    train_data = [(q, a) for q, a in my_train_set]
-    val_data = [(q, a) for q, a in my_val_set]
+_LAZY_EXPORTS = {
+    "LoopConfig": (".config", "LoopConfig"),
+    "SelfImprovingLoop": (".runner", "SelfImprovingLoop"),
+    "LoopAgents": (".runner", "LoopAgents"),
+    "LoopResult": (".runner", "LoopResult"),
+}
 
-    config = LoopConfig(max_iterations=10, frontier_size=5)
-    loop = SelfImprovingLoop(config, agents, manager, train_data, val_data)
-    result = await loop.run()
-"""
 
-from .config import LoopConfig
-from .runner import SelfImprovingLoop, LoopAgents, LoopResult
+def __getattr__(name: str) -> Any:
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    module = import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
 
-__all__ = ["SelfImprovingLoop", "LoopConfig", "LoopAgents", "LoopResult"]
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *_LAZY_EXPORTS})
+
+
+__all__ = list(_LAZY_EXPORTS)
