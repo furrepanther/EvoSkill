@@ -48,6 +48,11 @@ from src.schemas import (
 console = Console()
 
 
+def _memory_write_accepted(status: str) -> bool:
+    normalized = str(status or "").strip().lower()
+    return normalized in {"ok", "queued", "accepted"}
+
+
 # ── display helpers ──────────────────────────────────────────────────────────
 
 def _build_table(rows: list[dict], baseline_score: float | None) -> Table:
@@ -504,7 +509,7 @@ def run_cmd(continue_loop: bool, verbose: bool, quiet: bool):
         telemetry_path=telemetry_path,
     )
     if memory_results:
-        ok_count = sum(1 for item in memory_results if item.status == "ok")
+        ok_count = sum(1 for item in memory_results if _memory_write_accepted(item.status))
         console.print(f"  Memory Fabric: {ok_count}/{len(memory_results)} record(s) written")
 
     console.print(f"  Full report: {report_path}")

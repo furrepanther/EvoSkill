@@ -1,14 +1,15 @@
 """
-Utilities for converting between ProgramConfig and ClaudeAgentOptions.
+Utilities for converting between ProgramConfig and agent SDK payloads.
 
 These helpers allow seamless integration between the program registry
-and the Claude Agent SDK.
+and whichever agent runtime consumes the payload.
 """
 
+import os
 from datetime import datetime
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import ClaudeAgentOptions as SDKAgentOptions
 
 from .models import ProgramConfig
 
@@ -19,9 +20,9 @@ def config_to_options(
     *,
     add_dirs: list[Any] | None = None,
     permission_mode: str = "acceptEdits",
-) -> ClaudeAgentOptions:
+) -> SDKAgentOptions:
     """
-    Convert ProgramConfig to ClaudeAgentOptions.
+    Convert ProgramConfig to agent SDK options.
 
     Args:
         config: The program configuration
@@ -30,13 +31,13 @@ def config_to_options(
         permission_mode: Permission mode for tool execution
 
     Returns:
-        ClaudeAgentOptions ready for use with ClaudeSDKClient
+        Agent SDK options ready for use by the runtime client
     """
-    return ClaudeAgentOptions(
+    return SDKAgentOptions(
         system_prompt=config.system_prompt,
         allowed_tools=config.allowed_tools,
         output_format=config.output_format,
-        setting_sources=["user", "project"],  # Load skills from .claude/skills/
+        setting_sources=["user", "project"],  # Load skills from the project skill directory.
         permission_mode=permission_mode,
         add_dirs=add_dirs or [],
         cwd=cwd,
@@ -44,7 +45,7 @@ def config_to_options(
 
 
 def options_to_config(
-    options: ClaudeAgentOptions,
+    options: SDKAgentOptions,
     name: str,
     *,
     parent: str | None = None,
@@ -52,7 +53,7 @@ def options_to_config(
     metadata: dict[str, Any] | None = None,
 ) -> ProgramConfig:
     """
-    Convert ClaudeAgentOptions to ProgramConfig.
+    Convert agent SDK options to ProgramConfig.
 
     Args:
         options: The agent options to convert
@@ -77,6 +78,68 @@ def options_to_config(
         output_format=options.output_format,
         metadata=base_metadata,
     )
+
+
+def _system_prompt_to_text(system_prompt: Any) -> str:
+    if isinstance(system_prompt, str):
+        return system_prompt.strip()
+    if not isinstance(system_prompt, dict):
+        return ""
+
+    parts: list[str] = []
+    prepend = str(system_prompt.get("prepend", "")).strip()
+    append = str(system_prompt.get("append", "")).strip()
+    if prepend:
+        parts.append(prepend)
+    if append:
+        parts.append(append)
+    return "\n\n".join(parts).strip()
+
+
+def options_to_runtime_config(
+    options: Any,
+    *,
+    fallback_model: str | None = None,
+    fallback_provider_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Convert SDK options into a runtime-compatible dict payload.
+
+    Object-shaped options are normalized so the runtime execution path can stay
+    generic and avoid hard failures when a non-dict options object is supplied.
+    """
+    if isinstance(options, dict):
+        return dict(options)
+
+    payload: dict[str, Any] = {}
+
+    system_prompt = getattr(options, "system_prompt", None)
+    system_text = _system_prompt_to_text(system_prompt)
+    if system_text:
+        payload["system"] = system_text
+
+    output_format = getattr(options, "output_format", None)
+    if output_format is not None:
+        payload["format"] = output_format
+
+    allowed_tools = getattr(options, "allowed_tools", None) or []
+    payload["tools"] = {str(tool): True for tool in allowed_tools}
+
+    mode = getattr(options, "mode", None)
+    if mode:
+        payload["mode"] = str(mode)
+
+    model_id = getattr(options, "model", None) or fallback_model
+    if model_id:
+        payload["model_id"] = str(model_id)
+
+    provider_id = getattr(options, "provider_id", None) or fallback_provider_id
+    if provider_id is None:
+        provider_id = os.getenv("OPENCODE_PROVIDER_ID", "togetherai")
+    if provider_id:
+        payload["provider_id"] = str(provider_id)
+
+    return payload
 
 
 def merge_system_prompt(

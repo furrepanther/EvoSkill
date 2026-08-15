@@ -14,8 +14,10 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-_SHARED_SCRIPTS_ROOT = Path("/mnt/c/Users/furre/.gemini/antigravity/scripts")
-_SHARED_MEMFAB_CLIENT_PATH = _SHARED_SCRIPTS_ROOT / "lib" / "memfab_mcp_client.py"
+_SHARED_SCRIPTS_ROOT_CANDIDATES = (
+    Path("/home/Antigravity/scripts"),
+    Path("/mnt/f/Production/antigravity/scripts"),
+)
 _SHARED_MEMFAB_CLIENT_MODULE_NAME = "_evoskill_shared_memfab_mcp_client"
 
 
@@ -147,16 +149,28 @@ def _normalize_hits(payload: dict[str, Any]) -> tuple[MemoryFabricHit, ...]:
 
 @lru_cache(maxsize=1)
 def _load_shared_memfab_module() -> ModuleType | None:
-    if not _SHARED_MEMFAB_CLIENT_PATH.exists():
-        logger.info("Memory Fabric client helper not found at %s", _SHARED_MEMFAB_CLIENT_PATH)
+    shared_scripts_root = None
+    shared_memfab_client_path = None
+    for candidate in _SHARED_SCRIPTS_ROOT_CANDIDATES:
+        candidate_client = candidate / "lib" / "memfab_mcp_client.py"
+        if candidate_client.exists():
+            shared_scripts_root = candidate
+            shared_memfab_client_path = candidate_client
+            break
+
+    if shared_scripts_root is None or shared_memfab_client_path is None:
+        logger.info(
+            "Memory Fabric client helper not found in any known shared scripts root: %s",
+            ", ".join(str(path) for path in _SHARED_SCRIPTS_ROOT_CANDIDATES),
+        )
         return None
 
-    if str(_SHARED_SCRIPTS_ROOT) not in sys.path:
-        sys.path.insert(0, str(_SHARED_SCRIPTS_ROOT))
+    if str(shared_scripts_root) not in sys.path:
+        sys.path.insert(0, str(shared_scripts_root))
 
-    spec = spec_from_file_location(_SHARED_MEMFAB_CLIENT_MODULE_NAME, _SHARED_MEMFAB_CLIENT_PATH)
+    spec = spec_from_file_location(_SHARED_MEMFAB_CLIENT_MODULE_NAME, shared_memfab_client_path)
     if spec is None or spec.loader is None:
-        logger.warning("Unable to load Memory Fabric client helper from %s", _SHARED_MEMFAB_CLIENT_PATH)
+        logger.warning("Unable to load Memory Fabric client helper from %s", shared_memfab_client_path)
         return None
 
     module = module_from_spec(spec)

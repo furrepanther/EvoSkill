@@ -1,7 +1,7 @@
 """SDK configuration and selection logic.
 
-This module provides a global setting to choose between OpenCode and
-Gemini-backed execution paths.
+This module provides a global setting to choose between supported runtime
+execution paths.
 """
 
 from typing import Literal
@@ -32,11 +32,6 @@ def get_sdk() -> SDKType:
 def get_model() -> str | None:
     """Get the currently configured model, if any."""
     return _current_model
-
-
-def is_claude_sdk() -> bool:
-    """Check if claude-agent-sdk is the current SDK."""
-    return _current_sdk == "claude"
 
 
 def is_opencode_sdk() -> bool:

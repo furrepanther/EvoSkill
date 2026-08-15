@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, Type, TypeVar, Union
 
 from pydantic import BaseModel
 
-from .sdk_config import get_model, is_claude_sdk, is_gemini_sdk
+from .sdk_config import get_model, is_gemini_sdk
 from .structured_output import coerce_structured_output
+from src.registry.sdk_utils import options_to_runtime_config
 from src.gemini_cli import (
     build_gemini_prompt,
     extract_gemini_cwd,
@@ -20,23 +22,24 @@ from src.gemini_cli import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+OPENCODE_BINARY = Path("/mnt/f/Github/opencode/packages/opencode/dist/opencode-linux-x64/bin/opencode")
 
-# Import ClaudeAgentOptions at module level for type hints only
+# Import SDK options type at module level for type hints only
 if TYPE_CHECKING:
-    from claude_agent_sdk import ClaudeAgentOptions as ClaudeAgentOptionsType
+    from claude_agent_sdk import ClaudeAgentOptions as SDKAgentOptionsType
 else:
-    ClaudeAgentOptionsType = Any
+    SDKAgentOptionsType = Any
 
 # Type alias for options that can be static or dynamically generated
-# Supports both ClaudeAgentOptions and dict (for opencode)
+# Supports both SDK options objects and dict payloads
 OptionsProvider = Union[
-    ClaudeAgentOptionsType,
+    SDKAgentOptionsType,
     dict[str, Any],
-    Callable[[], Union[ClaudeAgentOptionsType, dict[str, Any]]],
+    Callable[[], Union[SDKAgentOptionsType, dict[str, Any]]],
 ]
 
 
-def _resolve_gemini_model(options: Union[ClaudeAgentOptionsType, dict[str, Any]]) -> str:
+def _resolve_gemini_model(options: Union[SDKAgentOptionsType, dict[str, Any]]) -> str:
     """Pick the best available Gemini model for the current run."""
     model = extract_gemini_model(options)
     if model:
@@ -49,7 +52,18 @@ def _resolve_gemini_model(options: Union[ClaudeAgentOptionsType, dict[str, Any]]
     return "gemini-3.1-pro-preview"
 
 
-def _extract_tools(options: Union[ClaudeAgentOptionsType, dict[str, Any]]) -> list[str]:
+def _resolve_opencode_binary() -> Path:
+    """Return the built OpenCode binary for this host."""
+    candidate = OPENCODE_BINARY.expanduser().resolve()
+    if candidate.is_file():
+        return candidate
+    raise RuntimeError(
+        "OpenCode binary missing at "
+        f"{candidate}. Build /mnt/f/Github/opencode before starting EvoSkill."
+    )
+
+
+def _extract_tools(options: Union[SDKAgentOptionsType, dict[str, Any]]) -> list[str]:
     """Extract the declared tool list for telemetry."""
     if isinstance(options, dict):
         tools = options.get("tools", {})
@@ -142,11 +156,11 @@ class AgentTrace(BaseModel, Generic[T]):
 
 
 class Agent(Generic[T]):
-    """Simple wrapper for running Claude agents.
+    """Simple wrapper for running agent SDK requests.
 
     Args:
-        options: Either a ClaudeAgentOptions instance (static) or a callable
-                 that returns ClaudeAgentOptions (dynamic, called on each run).
+        options: Either an SDK options instance (static) or a callable
+                 that returns SDK options (dynamic, called on each run).
         response_model: Pydantic model for structured output validation.
     """
 
@@ -158,7 +172,7 @@ class Agent(Generic[T]):
         self._options = options
         self.response_model = response_model
 
-    def _get_options(self) -> Union[ClaudeAgentOptionsType, dict[str, Any]]:
+    def _get_options(self) -> Union[SDKAgentOptionsType, dict[str, Any]]:
         """Get options, calling the provider if it's a callable."""
         if callable(self._options):
             return self._options()
@@ -168,28 +182,6 @@ class Agent(Generic[T]):
         """Execute a single query attempt."""
         options = self._get_options()
 
-        if is_claude_sdk():
-            # Claude SDK path
-            from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-
-            # Convert dict to ClaudeAgentOptions if needed
-            if isinstance(options, dict):
-                claude_opts = ClaudeAgentOptions(
-                    system_prompt=options.get("system"),
-                    allowed_tools=list(options.get("tools", {}).keys())
-                    if options.get("tools")
-                    else [],
-                    output_format=options.get("format"),
-                    setting_sources=["user", "project"],
-                    permission_mode="acceptEdits",
-                )
-                if "model_id" in options and "claude" in options["model_id"].lower():
-                    claude_opts.model = options["model_id"]
-                options = claude_opts
-
-            async with ClaudeSDKClient(options) as client:
-                await client.query(query)
-                return [msg async for msg in client.receive_response()]
         if is_gemini_sdk():
             # Gemini CLI path
             system_prompt = extract_gemini_system_prompt(options)
@@ -210,13 +202,14 @@ class Agent(Generic[T]):
 
             return [gemini_result]
         else:
-            # OpenCode SDK path
+            # Runtime SDK path
             from opencode_ai import AsyncOpencode
 
-            if not isinstance(options, dict):
-                raise TypeError(
-                    f"OpenCode SDK requires dict options, got {type(options)}"
-                )
+            options = options_to_runtime_config(
+                options,
+                fallback_model=get_model(),
+            )
+            opencode_binary = _resolve_opencode_binary()
 
             # Start opencode server if needed
             import subprocess
@@ -229,7 +222,7 @@ class Agent(Generic[T]):
             except Exception:
                 # Start server
                 subprocess.Popen(
-                    ["opencode", "serve", "--port", "4096", "--hostname", "127.0.0.1"],
+                    [str(opencode_binary), "serve", "--port", "4096", "--hostname", "127.0.0.1"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -254,7 +247,7 @@ class Agent(Generic[T]):
                 extra_body=extra_body if extra_body else None,
             )
 
-            # Return as single-item list for consistency with Claude SDK
+            # Return as single-item list for consistency with the SDK wrapper
             return [message]
 
     async def _run_with_retry(self, query: str) -> list[Any]:
@@ -288,36 +281,6 @@ class Agent(Generic[T]):
     async def run(self, query: str) -> AgentTrace[T]:
         messages = await self._run_with_retry(query)
 
-        if is_claude_sdk():
-            # Claude SDK: messages list with SystemMessage, AssistantMessage, ResultMessage
-            first = messages[0]
-            last = messages[-1]
-
-            # Try to parse structured output
-            raw_structured_output = last.structured_output
-            output, parse_error, structured_output_repaired = coerce_structured_output(
-                self.response_model,
-                raw_structured_output,
-                result_text=last.result,
-            )
-
-            return AgentTrace(
-                uuid=first.data.get("uuid"),
-                session_id=last.session_id,
-                model=first.data.get("model"),
-                tools=first.data.get("tools", []),
-                duration_ms=last.duration_ms,
-                total_cost_usd=last.total_cost_usd,
-                num_turns=last.num_turns,
-                usage=last.usage,
-                result=last.result,
-                is_error=last.is_error or parse_error is not None,
-                output=output,
-                structured_output_repaired=structured_output_repaired,
-                parse_error=parse_error,
-                raw_structured_output=raw_structured_output,
-                messages=messages,
-            )
         if is_gemini_sdk():
             # Gemini CLI JSON output: one structured wrapper result per query.
             gemini_result = messages[0]
@@ -362,7 +325,7 @@ class Agent(Generic[T]):
                 messages=[raw_message],
             )
         else:
-            # OpenCode SDK: single AssistantMessage with extra fields
+            # Runtime SDK: single assistant message with extra fields
             message = messages[0]
 
             # Extract structured output from info dict (extra field)
@@ -389,17 +352,12 @@ class Agent(Generic[T]):
             usage = info.get("tokens", {}) if info else {}
             cost = info.get("cost", 0.0) if info else 0.0
 
-            options = self._get_options()
-            model_name = (
-                options.get("model_id", "unknown")
-                if isinstance(options, dict)
-                else "unknown"
+            options = options_to_runtime_config(
+                self._get_options(),
+                fallback_model=get_model(),
             )
-            tools = (
-                list(options.get("tools", {}).keys())
-                if isinstance(options, dict) and options.get("tools")
-                else []
-            )
+            model_name = str(options.get("model_id", "unknown"))
+            tools = list(options.get("tools", {}).keys()) if options.get("tools") else []
 
             return AgentTrace(
                 uuid=message.session_id or "unknown",
